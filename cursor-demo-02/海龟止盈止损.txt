@@ -1,0 +1,96 @@
+'''
+策略名称：
+日级别海龟策略
+策略流程：
+每日固定时间执行, 上穿唐奇安上线买入，下穿唐奇安下线卖出。
+增加ATR与仓位管理。
+增加止盈止损。
+Author: 高顿量化
+Version: 1.0.0
+Date: 2024/06/01
+'''
+
+
+def initialize(context):
+    #用户可修改参数
+    #g.sec_dict = {"000628.SZ": 10000, "688183.SS": 100000, "300641.SZ":150000} #股票池 可以填单个或多个 建议不超过20个
+    #g.sec_dict = {"600660.SS": 50000}
+    g.sec_dict = {"600900.SS": 0.5,"688183.SS": 0.5}
+    #g.sec_dict = {"600660.SS": 12000,"688183.SS": 8000,"600900.SS": 8000}
+    #g.sec_dict = {"000628.SZ": 10000}
+    #g.sec_dict = {"688183.SS": 10000}  # 1 
+    #g.sec_dict = {"300641.SZ": 10000}
+    #g.sec_dict = {"000628.SZ": 10000,"600660.SS": 10000}
+    g.config = {
+        'event_time': '9:31',     # 触发时间  可设置范围是 09:30--11:29, 13:00--14:59
+        'n1': 10,                  # 买入参数
+        'n2': 25,                  # 卖出参数
+        'ATR':10,                 # ATR参数
+        '减仓ATR':0.03,           # 减仓时，每单位atr的变动减仓多少百分比的资金
+        '加仓ATR':0.02,           # 加仓时，每单位atr的变动增加多少百分比的资金
+        '入场ATR':0.02,           # 入场时，每单位atr的变动买入多少百分比的资金
+        'SL':-0.05,              # 止损
+        'TP':0.3                 # 止盈   
+    }
+    run_daily(context, daily_event, time=g.config['event_time'])  #设置触发时间
+
+
+def before_trading_start(context, data):
+    log.info('')
+    log.info('日级别海龟策略')
+    for sec, buy_amount in g.sec_dict.items():
+        log.info('{}:买入金额比率{}'.format(sec, buy_amount))
+    log.info('触发时间: {}'.format(g.config['event_time']))
+    log.info('策略正常运行 {}'.format(context.blotter.current_dt))
+
+
+def daily_event(context):
+    cash = context.portfolio.cash
+    for sec, buy_amount in g.sec_dict.items():
+        buy_amount = cash * buy_amount
+        log.info('{}:买入金额{}'.format(sec, buy_amount))
+        sec_his = get_history(count=60, frequency='1d', field=['close','low','high'], security_list=sec, fq='pre', include=False)
+        sec_his['up'] = sec_his['high'].shift(1).rolling(window=g.config['n1']).max()   #上线
+        sec_his['down'] = sec_his['low'].shift(1).rolling(window=g.config['n2']).min()   #下线
+        
+        high, low, close = sec_his['high'], sec_his['low'], sec_his['close']
+        trueHigh = high.where(high>(close.shift(1)), (close.shift(1)))
+        trueLow = low.where(low<(close.shift(1)), (close.shift(1)))
+        atr = (trueHigh - trueLow)[-g.config['ATR']:].mean()
+
+        posInfo = get_position(sec)
+        holdRet = posInfo.last_sale_price/posInfo.cost_basis-1 if posInfo.cost_basis!=0 else 0
+        if posInfo.enable_amount>0:
+            #清仓:持有股票时监控昨日最低价是否低于下线，低于下线卖出。增加止盈止损
+            if sec_his['low'][-1] < sec_his['down'][-1] or holdRet <= g.config['SL'] or holdRet >= g.config['TP']:
+                vol = posInfo.enable_amount
+                if vol >0:
+                    log.info('低于下线卖出的股票: {}'.format(vol))
+                    order(sec, -vol)
+                    
+            # 减仓
+            elif sec_his['low'][-1] <=  posInfo.cost_basis - atr:
+                vol = min(posInfo.enable_amount, buy_amount*g.config['减仓ATR']/atr//100*100)
+                log.info('减仓，每单位atr的变动: {}'.format(vol))
+                order(sec, -vol)
+                    
+            # 加仓
+            elif holdRet>0 and sec_his['high'][-1] >= posInfo.last_sale_price + 0.5*atr:
+                price = posInfo.last_sale_price
+                vol = min(context.portfolio.cash/price, buy_amount*g.config['加仓ATR']/atr)//100*100
+                log.info('加仓，每单位atr的变动: {}'.format(vol))
+                if vol > 0:
+                    order(sec, vol)
+         
+        if posInfo.amount==0:
+            #入场
+            if sec_his['high'][-1] > sec_his['up'][-1]:
+                price = posInfo.last_sale_price
+                vol = min(context.portfolio.cash/price, buy_amount*g.config['入场ATR']/atr)//100*100   #计算买入数量并取整百
+                if vol > 0:
+                    order(sec, vol)
+
+                    
+
+def handle_data(context, data):
+    pass

@@ -1,0 +1,200 @@
+'''
+策略名称：鸭头策略
+策略流程：
+1. 近n天股价全部在N0均线上
+2. 第一阶段：短暂调整打压，对应量能急剧萎缩，n1日均线下穿n2日均线
+3. 第二阶段：n1均线金叉n2上升；放量突破前期高点
+4. 增加指数股票池选股
+5. 增加每日资金再平衡
+Author: 量化交易工程师
+Version: 1.0.0
+Date: 2024/04/23
+'''
+
+def initialize(context):
+    # 用户可修改参数
+    g.config = {
+        'event_time': '9:31',     # 触发时间
+        'n': 20,                  # 股价在均线上方的天数
+        'N0': 60,                 # 长期均线参数
+        'n1': 5,                  # 短期均线参数
+        'n2': 10,                 # 中期均线参数
+        'volume_ratio': 0.5,      # 量能萎缩比例
+        'break_ratio': 1.05,      # 突破前期高点比例
+        'max_position': 0.2,      # 单个股票最大仓位
+        'rebalance_time': '14:50' # 资金再平衡时间
+    }
+    
+    # 指数股票池
+    g.index_pool = ["000028.XBHS"]  # 示例指数
+    
+    # 设置定时任务
+    run_daily(context, daily_event, time=g.config['event_time'])
+    run_daily(context, rebalance_portfolio, time=g.config['rebalance_time'])
+    
+    log.info('鸭头策略初始化完成')
+    log.info('策略参数: {}'.format(g.config))
+    log.info('指数股票池: {}'.format(g.index_pool))
+
+def before_trading_start(context, data):
+    log.info('')
+    log.info('===== 鸭头策略每日开始 =====')
+    log.info('当前时间: {}'.format(context.blotter.current_dt))
+    
+    # 获取指数成分股
+    g.stock_pool = []
+    for index_code in g.index_pool:
+        stocks = get_index_stocks(index_code)
+        g.stock_pool.extend(stocks)
+    g.stock_pool = list(set(g.stock_pool))  # 去重
+    
+    log.info('股票池数量: {}'.format(len(g.stock_pool)))
+    log.info('当前可用资金: {:.2f}'.format(context.portfolio.cash))
+    log.info('当前总资产: {:.2f}'.format(context.portfolio.total_value))
+
+def check_duck_head_pattern(sec, context):
+    """检查是否形成鸭头形态"""
+    log.info('开始检查股票 {} 是否形成鸭头形态'.format(sec))
+    
+    # 获取历史数据
+    hist = get_history(count=120, frequency='1d', 
+                      field=['close', 'volume', 'high'], 
+                      security_list=sec, fq='pre', include=False)
+    
+    if hist is None or len(hist) < 120:
+        log.info('股票 {} 历史数据不足，无法判断鸭头形态'.format(sec))
+        return False
+        
+    close = hist['close']
+    volume = hist['volume']
+    high = hist['high']
+    
+    # 1. 检查是否在N0均线上方
+    ma60 = close.rolling(window=g.config['N0']).mean()
+    if not all(close[-g.config['n']:] > ma60[-g.config['n']:]):
+        log.info('股票 {} 不满足近{}天股价全部在{}日均线上方的条件'.format(sec, g.config['n'], g.config['N0']))
+        return False
+    log.info('股票 {} 满足近{}天股价全部在{}日均线上方的条件'.format(sec, g.config['n'], g.config['N0']))
+    
+    # 2. 检查第一阶段：均线死叉和量能萎缩
+    ma5 = close.rolling(window=g.config['n1']).mean()
+    ma10 = close.rolling(window=g.config['n2']).mean()
+    
+    # 检查死叉
+    if not (ma5[-2] > ma10[-2] and ma5[-1] < ma10[-1]):
+        log.info('股票 {} 不满足{}日均线下穿{}日均线的死叉条件'.format(sec, g.config['n1'], g.config['n2']))
+        return False
+    log.info('股票 {} 满足{}日均线下穿{}日均线的死叉条件'.format(sec, g.config['n1'], g.config['n2']))
+    
+    # 检查量能萎缩
+    volume_ma5 = volume.rolling(window=5).mean()
+    if volume[-1] > volume_ma5[-1] * g.config['volume_ratio']:
+        log.info('股票 {} 不满足量能萎缩条件，当前量能: {:.2f}, 5日均量: {:.2f}'.format(
+            sec, volume[-1], volume_ma5[-1]))
+        return False
+    log.info('股票 {} 满足量能萎缩条件，当前量能: {:.2f}, 5日均量: {:.2f}'.format(
+        sec, volume[-1], volume_ma5[-1]))
+    
+    # 3. 检查第二阶段：均线金叉和放量突破
+    if not (ma5[-1] > ma10[-1] and ma5[-2] < ma10[-2]):  # 金叉
+        log.info('股票 {} 不满足{}日均线上穿{}日均线的金叉条件'.format(sec, g.config['n1'], g.config['n2']))
+        return False
+    log.info('股票 {} 满足{}日均线上穿{}日均线的金叉条件'.format(sec, g.config['n1'], g.config['n2']))
+    
+    # 检查是否放量突破前期高点
+    recent_high = high[-20:-1].max()
+    if not (close[-1] > recent_high * g.config['break_ratio'] and 
+            volume[-1] > volume_ma5[-1] * 1.5):
+        log.info('股票 {} 不满足放量突破前期高点的条件，当前价格: {:.2f}, 前期高点: {:.2f}, 突破比例: {:.2f}'.format(
+            sec, close[-1], recent_high, close[-1]/recent_high))
+        return False
+    log.info('股票 {} 满足放量突破前期高点的条件，当前价格: {:.2f}, 前期高点: {:.2f}, 突破比例: {:.2f}'.format(
+        sec, close[-1], recent_high, close[-1]/recent_high))
+    
+    log.info('股票 {} 完全符合鸭头形态条件，可以买入'.format(sec))
+    return True
+
+def daily_event(context):
+    """主要交易逻辑"""
+    log.info('===== 开始执行每日交易逻辑 =====')
+    cash = context.portfolio.cash
+    positions = context.portfolio.positions
+    
+    # 检查现有持仓
+    log.info('当前持仓数量: {}'.format(len(positions)))
+    for sec in list(positions.keys()):
+        pos = positions[sec]
+        if pos.amount > 0:
+            log.info('检查持仓股票 {} 是否仍符合策略条件'.format(sec))
+            # 如果不再符合策略条件，清仓
+            if not check_duck_head_pattern(sec, context):
+                log.info('股票 {} 不再符合策略条件，执行清仓操作'.format(sec))
+                order_target(sec, 0)
+                log.info('清仓: {} 不再符合策略条件'.format(sec))
+            else:
+                log.info('股票 {} 仍符合策略条件，继续持有'.format(sec))
+    
+    # 寻找新的交易机会
+    available_cash = cash * g.config['max_position']
+    log.info('可用于新买入的资金: {:.2f}'.format(available_cash))
+    
+    # 记录已检查的股票数量
+    checked_count = 0
+    matched_count = 0
+    
+    for sec in g.stock_pool:
+        if sec in positions and positions[sec].amount > 0:
+            continue
+            
+        checked_count += 1
+        if checked_count % 50 == 0:
+            log.info('已检查 {} 只股票，找到 {} 只符合鸭头形态的股票'.format(checked_count, matched_count))
+            
+        if check_duck_head_pattern(sec, context):
+            matched_count += 1
+            # 计算买入数量
+            price = get_snapshot(sec)[sec]['last_px']
+            amount = int(available_cash / price / 100) * 100  # 确保是100的整数倍
+            
+            if amount > 0:
+                log.info('准备买入股票 {}，价格: {:.2f}，数量: {}'.format(sec, price, amount))
+                order(sec, amount)
+                log.info('买入: {} 数量: {}'.format(sec, amount))
+            else:
+                log.info('股票 {} 计算买入数量为0，跳过'.format(sec))
+    
+    log.info('===== 每日交易逻辑执行完毕 =====')
+    log.info('共检查了 {} 只股票，找到 {} 只符合鸭头形态的股票'.format(checked_count, matched_count))
+
+def rebalance_portfolio(context):
+    """每日资金再平衡"""
+    log.info('===== 开始执行资金再平衡 =====')
+    positions = context.portfolio.positions
+    total_value = context.portfolio.total_value
+    target_value = total_value * g.config['max_position']
+    
+    log.info('当前总资产: {:.2f}，单个股票目标市值: {:.2f}'.format(total_value, target_value))
+    
+    rebalanced_count = 0
+    for sec in positions:
+        pos = positions[sec]
+        if pos.amount > 0:
+            current_value = pos.amount * pos.last_sale_price
+            deviation = abs(current_value - target_value) / target_value
+            log.info('股票 {} 当前市值: {:.2f}，偏离目标: {:.2%}'.format(sec, current_value, deviation))
+            
+            if deviation > 0.1:  # 偏离超过10%时再平衡
+                target_amount = int(target_value / pos.last_sale_price / 100) * 100
+                if target_amount != pos.amount:
+                    log.info('股票 {} 需要再平衡，当前数量: {}，目标数量: {}'.format(sec, pos.amount, target_amount))
+                    order_target(sec, target_amount)
+                    log.info('再平衡: {} 目标数量: {}'.format(sec, target_amount))
+                    rebalanced_count += 1
+            else:
+                log.info('股票 {} 偏离在可接受范围内，无需再平衡'.format(sec))
+    
+    log.info('===== 资金再平衡执行完毕 =====')
+    log.info('共对 {} 只股票进行了再平衡操作'.format(rebalanced_count))
+
+def handle_data(context, data):
+    pass 

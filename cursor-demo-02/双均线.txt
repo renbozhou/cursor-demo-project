@@ -1,0 +1,104 @@
+import pandas as pd 
+import numpy as np
+'''
+策略名称：
+日级别多指标策略
+策略流程：
+1.每日固定时间执行, 多指标交易;
+2.不同股票可根据不同资金买入;
+3.可设置止盈止损;
+Author: 高顿量化
+Version: 1.0.0
+Date: 2024/05/19
+'''
+
+def initialize(context):
+    #用户可修改参数
+    g.sec_dict = {"600900.SS": 100000} #股票池 可以填单个或多个 建议不超过20个。格式:"股票代码":股票买入金额
+
+    g.config = {
+        'event_time': '9:31',   # 触发时间  可设置范围是 09:30--11:29, 13:00--14:59
+        "MA": [5, 15, 0],       # 双均线参数，第一个值为快线参数，第二个值为慢线参数，第三个值表示是否启用双均线指标：1表示启用，0表示不启用
+        "KDJ": [9, 3, 3, 1],    # KDJ参数，前三个参数分别为n周期,m1,m2，第四个值表示是否启用KDJ指标：1表示启用，0表示不启用
+        "RSI": [6, 0],          # RSI参数，第一个参数为RSI周期参数，第二个参数表示是否启用RSI指标：1表示启用，0表示不启用
+        "CCI": [14, 1]          # KDJ参数，第一个参数为RSI周期参数，第二个参数表示是否启用CCI指标：1表示启用，0表示不启用
+    }
+    
+    run_daily(context, daily_event, time=g.config['event_time'])  #设置触发时间
+    
+def before_trading_start(context, data):
+    log.info('日级别多指标策略')
+    log.info('设置成功')
+    log.info('触发时间: {}'.format(g.config['event_time']))
+    log.info('策略正常运行 {}'.format(context.blotter.current_dt))
+    strtInfo = []
+    for strt in ["MA", "KDJ", "RSI", "CCI"]:
+        if g.config[strt][-1]:
+            strtInfo.append(strt)
+    log.info("策略使用{}指标进行选股".format(strtInfo))
+    log.info('')
+    
+def daily_event(context):
+    for sec, tradeAmount in g.sec_dict.items():
+        secData = get_history(61, '1d', ['close', 'open', 'high', 'low'], sec, fq='pre', include=False)
+        
+        if g.config['MA'][-1]:
+            # 指标1:MACD
+            m1 = secData.close.rolling(g.config['MA'][0]).mean()
+            m2 = secData.close.rolling(g.config['MA'][1]).mean()
+            condBuy1 = m1[-1]> m2[-1] and m1[-2] <= m2[-2]
+            condSell1 = m1[-1]<= m2[-1] and m1[-2] > m2[-2]
+        else:
+            condBuy1 = True
+            condSell1 =False
+        
+        if g.config['KDJ'][-1]:
+            # 指标2:KDJ
+            k_, d_, j_ = get_KDJ(secData['high'].values, secData['low'].values, secData['close'].values, g.config['KDJ'][0], g.config['KDJ'][1], g.config['KDJ'][2])
+            # KDJ买入判断
+            condBuy2 = ((d_[-2] > k_[-2] and d_[-1] <= k_[-1])) and ((abs(j_[-1])<=40) and (j_[-1]>j_[-2]))
+            # KDJ卖出判断
+            condSell2 = ((d_[-2] <= k_[-2] and d_[-1] > k_[-1])) and ((abs(j_[-1]-80)<=40) and (j_[-1]<j_[-2]))
+        else:
+            condBuy2 = True
+            condSell2 =False    
+            
+        if g.config['RSI'][-1]:
+            # 指标3:RSI
+            rsi_ = get_RSI(secData['close'].values, g.config['RSI'][0])
+            # RSI买入判断
+            condBuy3 = rsi_[-1]<30
+            # RSI卖出判断
+            condSell3 = rsi_[-1]>70
+        else:
+            condBuy3 = True
+            condSell3 =False  
+        
+        if g.config['CCI'][-1]:
+            # 指标4:CCI
+            cci_ = get_CCI(secData['high'].values, secData['low'].values, secData['close'].values, g.config['CCI'][0])
+            # CCI买入判断
+            condBuy4 = cci_[-2] <=-100 and cci_[-1] >-100
+            # CCI卖出判断
+            condSell4 = cci_[-2] >-100 and cci_[-1] <=-100
+        else:
+            condBuy4 = True
+            condSell4 =False  
+            
+        posInfo = get_position(sec)
+        holdRet = posInfo.last_sale_price/posInfo.cost_basis-1 if posInfo.cost_basis!=0 else 0
+        if posInfo.enable_amount>0:
+            # 卖出
+            if condSell1 or condSell2 or condSell3 or condSell4 or holdRet<=-0.1 or holdRet>=0.2:
+                vol = posInfo.enable_amount
+                order(sec, -vol)
+
+        # 买入
+        if posInfo.amount==0:
+            if condBuy1 and condBuy2 and condBuy3 and condBuy4:
+                vol = min(context.portfolio.cash, tradeAmount)/posInfo.last_sale_price//100*100   #计算买入数量并取整百
+                order(sec, vol)                
+        
+
+def handle_data(context, data):
+    pass
